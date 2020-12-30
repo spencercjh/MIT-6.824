@@ -22,6 +22,21 @@ type ExampleReply struct {
 	Y int
 }
 
+type RegisterWorkerArgs struct {
+}
+
+type RegisterWorkerReply struct {
+	WorkerId int
+}
+
+type RegisterTaskArgs struct {
+	WorkerId int
+}
+
+type RegisterTaskReply struct {
+	Task Task
+}
+
 // Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
