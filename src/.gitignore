@@ -7,3 +7,4 @@ mrtmp.*
 /kvpaxos/x.txt
 *.so
 mr-out*
+mr-*-*

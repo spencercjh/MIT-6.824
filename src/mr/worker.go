@@ -1,6 +1,12 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -11,7 +17,7 @@ import "hash/fnv"
 //
 func ihash(key string) int {
 	h := fnv.New32a()
-	h.Write([]byte(key))
+	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
@@ -30,10 +36,12 @@ type worker struct {
 }
 
 // 1. worker register itself and get a workerId from Master
-// 2. worker register(get) a task from Master by the workerId
-// 3. do the task
-// 3.1 MAP_PHASE task
-// 3.2 REDUCE_PHASE task
+// 2. loop
+// 2.1 worker register(get) a task from Master by the workerId
+// 2.2 do the task
+// 2.2.1 MAP_PHASE task or
+// 2.2.2 REDUCE_PHASE task
+// 2.3 if there is no alive task, exit
 func (w worker) run() {
 	w.registerWorker()
 	// if reqTask conn fail, worker exit
@@ -67,24 +75,107 @@ func (w worker) registerTask() Task {
 	return reply.Task
 }
 
-func (w worker) doTask(task Task) Task {
+func (w worker) doTask(task Task) {
 	LogDebug("Worker begin doing task")
 	switch task.TaskPhase {
 	case MAP_PHASE:
-		return w.doMapTask(task)
+		w.doMapTask(task)
 	case REDUCE_PHASE:
-		return w.doReduceTask(task)
+		w.doReduceTask(task)
 	default:
 		panic("Wrong phase")
 	}
 }
 
-func (w worker) doMapTask(task Task) Task {
-	return task
+func (w worker) doMapTask(task Task) {
+	filename := task.Filename
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v because %v", filename, err)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v because %v", filename, err)
+	}
+	if err = file.Close(); err != nil {
+		log.Fatalf("cannot close %v because %v", filename, err)
+	}
+	// do map
+	keyValues := w.mapFunction(filename, string(content))
+
+	// split the intermediate data into NumReduceTask parts
+	reduces := make([][]KeyValue, task.NumReduceTask)
+	for _, keyValue := range keyValues {
+		index := ihash(keyValue.Key) % task.NumReduceTask
+		reduces[index] = append(reduces[index], keyValue)
+	}
+
+	// save them
+	for idx, lines := range reduces {
+		reduceFileName := reduceName(task.TaskId, idx)
+		reduceFile, err := os.Create(reduceFileName)
+		if err != nil {
+			w.reportTaskStatus(task, false, err)
+		}
+		enc := json.NewEncoder(reduceFile)
+		for _, kv := range lines {
+			if err := enc.Encode(&kv); err != nil {
+				w.reportTaskStatus(task, false, err)
+			}
+
+		}
+		if err := reduceFile.Close(); err != nil {
+			w.reportTaskStatus(task, false, err)
+		}
+	}
+	w.reportTaskStatus(task, true, nil)
 }
 
-func (w worker) doReduceTask(task Task) Task {
-	return task
+func (w worker) doReduceTask(task Task) {
+	// its format is: abc: 1,1,1,1,1,1,1,1,1,1 ...
+	wordNums := make(map[string][]string)
+	for i := 0; i < task.NumMapTask; i++ {
+		reduceFileName := reduceName(i, task.TaskId)
+		file, err := os.Open(reduceFileName)
+		if err != nil {
+			// report error
+			panic(err)
+		}
+		decoder := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := decoder.Decode(&kv); err != nil {
+				break
+			}
+			// key doesn't exist, put a pair <word,empty string array>
+			if _, ok := wordNums[kv.Key]; !ok {
+				wordNums[kv.Key] = make([]string, 0, 100)
+			}
+			wordNums[kv.Key] = append(wordNums[kv.Key], kv.Value)
+		}
+	}
+	// store reduce result
+	result := make([]string, 0, 1000)
+	for word, nums := range wordNums {
+		result = append(result, fmt.Sprintf("%v %v\n", word, w.reduceFunction(word, nums)))
+	}
+
+	// rwxrwxrwx and notice that perm is a uint32
+	if err := ioutil.WriteFile(mergeName(task.TaskId), []byte(strings.Join(result, "")), 0777); err != nil {
+		w.reportTaskStatus(task, false, err)
+		return
+	}
+	w.reportTaskStatus(task, true, nil)
+}
+
+func (w *worker) reportTaskStatus(task Task, done bool, err error) {
+	LogDebug("Worker reportTaskStatus")
+	if err != nil {
+		log.Printf("%v", err)
+	}
+	args := ReportTaskStatusArgs{w.workerId, task.TaskId, done, task.TaskPhase}
+	call("Master.ReportTaskStatus", &args, &ReportTaskStatusReply{})
+	LogDebug("Worker call Master.ReportTaskStatus with args: %v", args)
 }
 
 //
@@ -138,7 +229,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
-	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
 	if err == nil {
@@ -146,5 +236,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 
 	fmt.Println(err)
+
+	_ = c.Close()
 	return false
 }

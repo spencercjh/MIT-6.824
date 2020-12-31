@@ -37,6 +37,17 @@ type RegisterTaskReply struct {
 	Task Task
 }
 
+type ReportTaskStatusArgs struct {
+	WorkerId  int
+	TaskId    int
+	Done      bool
+	TaskPhase TaskPhase
+}
+
+type ReportTaskStatusReply struct {
+	Error error
+}
+
 // Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name

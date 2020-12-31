@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -11,8 +12,8 @@ import "net/rpc"
 import "net/http"
 
 const (
-	SCHEDULER_INTERVAL = time.Millisecond * 500
-	TASK_TIMEOUT       = time.Second * 10
+	SchedulerInterval = time.Millisecond * 100
+	TaskTimeout       = time.Second * 10
 )
 
 type Master struct {
@@ -23,15 +24,17 @@ type Master struct {
 	mapTaskAmount int
 	// given by mrmaster.go
 	reduceTaskAmount int
-	// task queue
-	tasks chan Task
-	mutex sync.Mutex
-	// each task's status
-	taskStatuses []TaskStatus
 	// map or reduce phase
 	taskPhase TaskPhase
 	// whether all tasks finished
 	done bool
+
+	// update following shared fields needs to be lock
+	mutex sync.Mutex
+	// task queue
+	tasks chan Task
+	// each task's status
+	taskStatuses []TaskStatus
 	// worker sequence
 	workerSequence int
 }
@@ -53,9 +56,6 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	//m.mutex.Lock()
-	//defer m.mutex.Unlock()
-
 	return m.done
 }
 
@@ -68,7 +68,7 @@ func (m *Master) initMapTasks() {
 func (m *Master) tickScheduler() {
 	for !m.Done() {
 		go m.scheduler()
-		time.Sleep(SCHEDULER_INTERVAL)
+		time.Sleep(SchedulerInterval)
 	}
 }
 
@@ -85,6 +85,7 @@ func (m *Master) scheduler() {
 	allFinished := true
 	for index, taskStatus := range m.taskStatuses {
 		switch taskStatus.Status {
+		// add task to the channel
 		case READY:
 			allFinished = false
 			m.tasks <- m.setupOneTask(index)
@@ -93,12 +94,14 @@ func (m *Master) scheduler() {
 			allFinished = false
 		case RUNNING:
 			allFinished = false
-			if time.Now().Sub(taskStatus.StartTime) > TASK_TIMEOUT {
+			// if the task is timeout, change its status and add it to channel again
+			if time.Now().Sub(taskStatus.StartTime) > TaskTimeout {
 				m.taskStatuses[index].Status = IN_QUEUE
 				m.tasks <- m.setupOneTask(index)
 			}
 		case FINISHED:
 		case ERROR:
+			// if there is an error about the task, change its status and add it to channel again
 			allFinished = false
 			m.taskStatuses[index].Status = IN_QUEUE
 			m.tasks <- m.setupOneTask(index)
@@ -107,6 +110,7 @@ func (m *Master) scheduler() {
 		}
 	}
 	if allFinished {
+		LogDebug("All %s tasks finished", m.taskStatuses)
 		if m.taskPhase == MAP_PHASE {
 			m.initReduceTasks()
 		} else {
@@ -147,14 +151,14 @@ func (m *Master) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWorkerR
 func (m *Master) RegisterTask(args *RegisterTaskArgs, reply *RegisterTaskReply) error {
 	LogDebug("Receive worker request RegisterTask")
 
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	task := <-m.tasks
 	if task.Alive {
 		if task.TaskPhase != m.taskPhase {
 			panic("Illegal request task phase")
 		}
+
+		m.mutex.Lock()
+		defer m.mutex.Unlock()
 
 		m.taskStatuses[task.TaskId].Status = RUNNING
 		m.taskStatuses[task.TaskId].WorkerId = args.WorkerId
@@ -169,6 +173,25 @@ func (m *Master) initReduceTasks() {
 	m.taskPhase = REDUCE_PHASE
 	m.taskStatuses = make([]TaskStatus, m.reduceTaskAmount)
 	LogDebug("Master init %d reduce tasks", m.reduceTaskAmount)
+}
+
+func (m *Master) ReportTaskStatus(args *ReportTaskStatusArgs, reply *ReportTaskStatusReply) error {
+	LogDebug("Receive worker request ReportTaskStatus with args: %v", args)
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.taskPhase != args.TaskPhase || args.WorkerId != m.taskStatuses[args.TaskId].WorkerId {
+		reply.Error = errors.New("illegal task")
+		return nil
+	}
+
+	if args.Done {
+		m.taskStatuses[args.TaskId].Status = FINISHED
+	} else {
+		m.taskStatuses[args.TaskId].Status = ERROR
+	}
+
+	return nil
 }
 
 //
@@ -206,11 +229,11 @@ func MakeMaster(files []string, nReduce int) *Master {
 // start a thread that listens for RPCs from worker.go
 //
 func (m *Master) server() {
-	rpc.Register(m)
+	_ = rpc.Register(m)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
-	os.Remove(sockname)
+	_ = os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
