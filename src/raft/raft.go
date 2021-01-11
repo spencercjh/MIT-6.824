@@ -24,8 +24,6 @@ import "../labrpc"
 // import "bytes"
 // import "../labgob"
 
-
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -43,6 +41,9 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,6 +58,18 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on all servers
+	currentTerm int
+	votedFor    int
+	logs        []LogEntry
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -85,7 +98,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -108,15 +120,20 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// candidate’s term
+	term int
+	// candidate requesting vote
+	candidateId int
+	// index of candidate’s last log entry (§5.4)
+	lastLogIndex int
+	// term of candidate’s last log entry (§5.4)
+	lastLogTerm int
 }
 
 //
@@ -125,6 +142,10 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	// currentTerm, for candidate to update itself
+	term int
+	// true means candidate received vote
+	voteGranted bool
 }
 
 //
@@ -132,6 +153,25 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	LogDebug("Received RequestVote with args: %v", args)
+
+	reply.term = args.term
+	reply.voteGranted = false
+
+	// Reply false if term < currentTerm (§5.1)
+	if args.term < rf.currentTerm {
+		return
+	} else if args.term == rf.currentTerm {
+
+	} else {
+		// If votedFor is null or candidateId, and candidate’s log is at
+		// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+		rf.currentTerm++
+	}
+
 }
 
 //
@@ -168,7 +208,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -189,7 +228,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -237,7 +275,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
